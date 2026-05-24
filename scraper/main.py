@@ -2,9 +2,11 @@
 Job scraper for Israeli tech companies.
 Runs daily via GitHub Actions and stores results in Supabase.
 
-Two-phase approach:
-  Phase 1 (fast): Scrape job listings → get title + URL + location
-  Phase 2 (smart): For NEW jobs only → fetch description + extract skills via Claude
+Strategy:
+  1. Detect ATS platform (from URL or by inspecting page iframes)
+  2. Use platform-specific API when available (fast + accurate + includes description)
+  3. Fallback to browser HTML scraping with smart filtering
+  4. Phase 2 enrichment with Claude only for jobs missing description
 """
 
 import asyncio
@@ -14,11 +16,12 @@ import re
 import sys
 from collections import defaultdict
 from datetime import datetime, timezone
-from urllib.parse import urljoin, urlparse
+from html import unescape
+from urllib.parse import urljoin, urlparse, parse_qs
 
 import anthropic
 import httpx
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+from playwright.async_api import async_playwright, BrowserContext, Page
 from supabase import create_client, Client
 
 # ─── Config ──────────────────────────────────────────────────────────────────
@@ -26,24 +29,37 @@ from supabase import create_client, Client
 COMPANIES_FILE = os.path.join(os.path.dirname(__file__), "companies.json")
 
 ISRAEL_KEYWORDS = {
-    "israel", "tel aviv", "herzliya", "petah tikva", "raanana", "ra'anana",
-    "rishon", "haifa", "beer sheva", "netanya", "rehovot", "holon",
-    "givatayim", "kfar saba", "yokneam", "rosh haayin", "caesarea",
-    "ישראל", "תל אביב", "הרצליה", "פתח תקווה", "ראשון לציון",
-    "חיפה", "באר שבע", "נתניה", "רחובות", "הולון", "כפר סבא"
+    "israel", "tel aviv", "tel-aviv", "herzliya", "herzeliya", "petah tikva",
+    "petach tikva", "raanana", "ra'anana", "rishon", "haifa", "beer sheva",
+    "be'er sheva", "netanya", "rehovot", "holon", "givatayim", "kfar saba",
+    "yokneam", "yoqneam", "rosh haayin", "caesarea", "ramat gan", "modiin",
+    "jerusalem", "ישראל", "תל אביב", "הרצליה", "פתח תקווה", "ראשון לציון",
+    "חיפה", "באר שבע", "נתניה", "רחובות", "הולון", "כפר סבא", "ירושלים",
+    "רמת גן", "יקנעם",
 }
 
+# Reject these link texts (clearly not job titles)
 SKIP_LINK_WORDS = {
     "login", "sign in", "register", "home", "about", "contact", "blog",
     "privacy", "terms", "faq", "newsletter", "press", "media", "investors",
     "cookie", "sitemap", "accessibility", "עברית", "english", "follow",
-    "instagram", "twitter", "linkedin", "facebook", "youtube"
+    "instagram", "twitter", "linkedin", "facebook", "youtube", "apply",
+    "apply now", "learn more", "read more", "see all", "view all", "load more",
+    "next", "previous", "back to", "search jobs", "all jobs", "all departments",
+    "view job", "see details", "more info",
 }
 
-# Claude model for extraction (fast + cheap)
+# Reject URLs that point to apply forms / generic pages, not job descriptions
+SKIP_URL_PATTERNS = [
+    r"/apply($|[/?#])", r"/application", r"job_app", r"/login", r"/register",
+    r"/refer", r"\.pdf($|\?)", r"mailto:", r"tel:", r"javascript:",
+]
+
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
-# Max jobs to enrich with details per run (to stay within rate limits)
-MAX_DETAILS_PER_RUN = 200
+MAX_DETAILS_PER_RUN = 300  # Phase 2 cap per run
+
+# Default browser headers
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
 
 # ─── Supabase ─────────────────────────────────────────────────────────────────
@@ -63,8 +79,14 @@ def upsert_jobs(supabase: Client, jobs: list[dict]):
     now = datetime.now(timezone.utc).isoformat()
     for job in jobs:
         job["last_seen"] = now
+        # If job already comes with description, mark as fetched
+        if job.get("description"):
+            job["details_fetched"] = True
+            job["details_fetched_at"] = now
     try:
-        supabase.table("jobs").upsert(jobs, on_conflict="url").execute()
+        # Chunk to avoid payload limits
+        for i in range(0, len(jobs), 100):
+            supabase.table("jobs").upsert(jobs[i:i+100], on_conflict="url").execute()
         print(f"  ✓ Upserted {len(jobs)} jobs")
     except Exception as e:
         print(f"  ✗ Supabase error: {e}", file=sys.stderr)
@@ -73,17 +95,18 @@ def upsert_jobs(supabase: Client, jobs: list[dict]):
 def mark_inactive_jobs(supabase: Client, company: str, active_urls: set[str]):
     try:
         res = supabase.table("jobs").select("url").eq("company", company).eq("is_active", True).execute()
-        existing_urls = {row["url"] for row in res.data}
-        stale = existing_urls - active_urls
+        existing = {row["url"] for row in res.data}
+        stale = existing - active_urls
         if stale:
-            supabase.table("jobs").update({"is_active": False}).in_("url", list(stale)).execute()
+            for i in range(0, len(stale), 100):
+                chunk = list(stale)[i:i+100]
+                supabase.table("jobs").update({"is_active": False}).in_("url", chunk).execute()
             print(f"  → Marked {len(stale)} jobs as inactive")
     except Exception as e:
         print(f"  ✗ Could not mark inactive for {company}: {e}", file=sys.stderr)
 
 
 def get_jobs_needing_details(supabase: Client) -> list[dict]:
-    """Return jobs that don't have details fetched yet."""
     try:
         res = (
             supabase.table("jobs")
@@ -110,97 +133,395 @@ def save_job_details(supabase: Client, job_id: str, details: dict):
         print(f"  ✗ Could not save details for job {job_id}: {e}", file=sys.stderr)
 
 
-# ─── ATS: Greenhouse ──────────────────────────────────────────────────────────
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+TAG_RE = re.compile(r"<[^>]+>")
+WS_RE = re.compile(r"\s+")
+
+
+def strip_html(html: str) -> str:
+    if not html:
+        return ""
+    txt = TAG_RE.sub(" ", html)
+    txt = unescape(txt)
+    return WS_RE.sub(" ", txt).strip()
+
+
+def is_israel_location(loc: str) -> bool:
+    if not loc:
+        return False
+    low = loc.lower()
+    return any(kw in low for kw in ISRAEL_KEYWORDS)
+
+
+def clean_title(title: str, location: str = "") -> str:
+    """Strip common junk that gets appended by HTML scraping."""
+    if not title:
+        return ""
+    t = title.strip()
+    # Remove trailing "Apply" / "Apply Now"
+    t = re.sub(r"\s*(Apply Now|Apply|הגישו מועמדות|הגש מועמדות)\s*$", "", t, flags=re.I)
+    # Remove trailing location if it matches what we know
+    if location:
+        loc_pat = re.escape(location.split(",")[0].strip())
+        if loc_pat:
+            t = re.sub(rf"\s*{loc_pat}.*$", "", t, flags=re.I)
+    # Also strip well-known city names from end of title
+    for city in ["Herzliya", "Tel Aviv", "Tel-Aviv", "Petah Tikva", "Ra'anana",
+                 "Raanana", "Jerusalem", "Israel"]:
+        t = re.sub(rf"\s*{re.escape(city)}\s*$", "", t, flags=re.I)
+    return WS_RE.sub(" ", t).strip()
+
+
+def url_looks_like_apply_form(url: str) -> bool:
+    low = url.lower()
+    return any(re.search(p, low) for p in SKIP_URL_PATTERNS)
+
+
+# ─── ATS: Greenhouse (board API) ──────────────────────────────────────────────
 
 def extract_greenhouse_slug(url: str) -> tuple[str | None, str | None]:
-    m = re.search(r"greenhouse\.io/([^/?#&]+)", url)
-    slug = m.group(1) if m else None
-    m2 = re.search(r"(?:offices\[\]=|gh_office=)(\d+)", url)
-    office_id = m2.group(1) if m2 else None
+    m = re.search(r"greenhouse\.io/(?:embed/job_board\?for=|embed/job_app\?for=)?([^/?#&]+)",
+                  url)
+    slug = None
+    if m:
+        slug = m.group(1)
+        if slug in ("embed", "job-boards", "job_boards"):
+            slug = None
+    if not slug:
+        # job-boards.greenhouse.io/{slug}
+        m = re.search(r"job-boards\.greenhouse\.io/([^/?#&]+)", url)
+        slug = m.group(1) if m else None
+    if not slug:
+        # for=xxx query param
+        q = parse_qs(urlparse(url).query)
+        slug = (q.get("for") or [None])[0]
+    office_id = None
+    m2 = re.search(r"(?:offices(?:\[\])?=|gh_office=)(\d+)", url)
+    if m2:
+        office_id = m2.group(1)
     return slug, office_id
 
 
-async def scrape_greenhouse(company_name: str, url: str) -> list[dict]:
-    slug, office_id = extract_greenhouse_slug(url)
+async def scrape_greenhouse(http: httpx.AsyncClient, company: str, url: str,
+                            slug: str | None = None, office_id: str | None = None) -> list[dict]:
+    if slug is None:
+        slug, office_id = extract_greenhouse_slug(url)
     if not slug:
         return []
 
-    api_url = f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true"
+    api = f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true"
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=20) as client:
-            resp = await client.get(api_url)
-            if resp.status_code != 200:
-                return []
-            data = resp.json()
+        resp = await http.get(api)
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
     except Exception as e:
-        print(f"  Greenhouse API error for {company_name}: {e}")
+        print(f"  Greenhouse API error for {company}: {e}")
         return []
 
     jobs = []
     for job in data.get("jobs", []):
-        location = job.get("location", {}).get("name", "") or ""
-        offices = job.get("offices", []) or []
+        location = (job.get("location") or {}).get("name", "") or ""
+        offices = job.get("offices") or []
         office_ids = {str(o.get("id", "")) for o in offices}
-        loc_lower = location.lower()
-        is_israel = any(kw in loc_lower for kw in ISRAEL_KEYWORDS)
+        office_names = " ".join((o.get("name") or "") for o in offices)
+        is_il = is_israel_location(location) or is_israel_location(office_names)
         if office_id and office_id in office_ids:
-            is_israel = True
-        if not is_israel and office_id:
+            is_il = True
+        if not is_il:
             continue
-        if not is_israel and not office_id:
-            continue
-
+        content_html = unescape(job.get("content") or "")
+        description = strip_html(content_html)[:5000] or None
         jobs.append({
-            "company": company_name,
-            "title": job.get("title", "").strip(),
-            "url": job.get("absolute_url", ""),
+            "company": company,
+            "title": (job.get("title") or "").strip(),
+            "url": job.get("absolute_url") or "",
             "location": location,
             "is_active": True,
+            "description": description,
         })
-
     return jobs
 
 
 # ─── ATS: Comeet ─────────────────────────────────────────────────────────────
 
-async def scrape_comeet(company_name: str, url: str) -> list[dict]:
+async def scrape_comeet(http: httpx.AsyncClient, company: str, url: str) -> list[dict]:
     m = re.search(r"comeet\.com/jobs/([^/]+)/([^/?#]+)", url)
     if not m:
         return []
     slug, code = m.group(1), m.group(2)
     m2 = re.search(r"location=([^&]+)", url)
     loc_param = f"?location={m2.group(1)}" if m2 else ""
-    api_url = f"https://www.comeet.com/jobs/{slug}/{code}.json{loc_param}"
-
+    api = f"https://www.comeet.com/jobs/{slug}/{code}.json{loc_param}"
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=20) as client:
-            resp = await client.get(api_url)
-            if resp.status_code != 200:
-                return []
-            data = resp.json()
+        resp = await http.get(api)
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
     except Exception as e:
-        print(f"  Comeet API error for {company_name}: {e}")
+        print(f"  Comeet API error for {company}: {e}")
         return []
 
     jobs = []
-    for position in data if isinstance(data, list) else data.get("positions", []):
-        loc = position.get("location", {}).get("city", "") or ""
-        country = position.get("location", {}).get("country", "") or ""
-        loc_lower = (loc + " " + country).lower()
-        if not any(kw in loc_lower for kw in ISRAEL_KEYWORDS):
+    positions = data if isinstance(data, list) else data.get("positions", [])
+    for p in positions:
+        loc = (p.get("location") or {})
+        city = loc.get("city", "") or ""
+        country = loc.get("country", "") or ""
+        loc_str = ", ".join([x for x in [city, country] if x])
+        if not is_israel_location(loc_str):
             continue
+        # Description: comeet positions can include details directly
+        desc_html = p.get("details", {}).get("description") if isinstance(p.get("details"), dict) else None
+        desc = strip_html(desc_html or "")[:5000] or None
         jobs.append({
-            "company": company_name,
-            "title": position.get("name", "").strip(),
-            "url": position.get("url_active", url),
-            "location": f"{loc}, {country}".strip(", "),
+            "company": company,
+            "title": (p.get("name") or "").strip(),
+            "url": p.get("url_active") or p.get("url") or url,
+            "location": loc_str,
             "is_active": True,
+            "description": desc,
         })
-
     return jobs
 
 
-# ─── Browser scraper (Playwright) ────────────────────────────────────────────
+# ─── ATS: Ashby ──────────────────────────────────────────────────────────────
+
+def extract_ashby_slug(url: str) -> str | None:
+    m = re.search(r"jobs\.ashbyhq\.com/([^/?#]+)", url)
+    if m:
+        return m.group(1)
+    m = re.search(r"ashbyhq\.com/(?:embed\?org=)([^&]+)", url)
+    if m:
+        return m.group(1)
+    return None
+
+
+async def scrape_ashby(http: httpx.AsyncClient, company: str, url: str,
+                       slug: str | None = None) -> list[dict]:
+    if slug is None:
+        slug = extract_ashby_slug(url)
+    if not slug:
+        return []
+    api = f"https://api.ashbyhq.com/posting-api/job-board/{slug}?includeCompensation=false"
+    try:
+        resp = await http.get(api)
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+    except Exception as e:
+        print(f"  Ashby API error for {company}: {e}")
+        return []
+
+    jobs = []
+    for j in data.get("jobs", []):
+        loc = j.get("location", "") or ""
+        if not is_israel_location(loc):
+            # Check secondary locations
+            sec = " ".join(j.get("secondaryLocations", []) or [])
+            if not is_israel_location(sec):
+                continue
+        desc_html = j.get("descriptionHtml") or ""
+        desc = strip_html(desc_html)[:5000] or None
+        jobs.append({
+            "company": company,
+            "title": (j.get("title") or "").strip(),
+            "url": j.get("jobUrl") or j.get("applyUrl") or "",
+            "location": loc,
+            "is_active": True,
+            "description": desc,
+        })
+    return jobs
+
+
+# ─── ATS: Lever ──────────────────────────────────────────────────────────────
+
+def extract_lever_slug(url: str) -> str | None:
+    m = re.search(r"(?:jobs\.lever\.co|lever\.co/(?:postings/)?)([^/?#]+)", url)
+    if m:
+        slug = m.group(1)
+        if slug not in ("postings",):
+            return slug
+    return None
+
+
+async def scrape_lever(http: httpx.AsyncClient, company: str, url: str,
+                       slug: str | None = None) -> list[dict]:
+    if slug is None:
+        slug = extract_lever_slug(url)
+    if not slug:
+        return []
+    api = f"https://api.lever.co/v0/postings/{slug}?mode=json"
+    try:
+        resp = await http.get(api)
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+    except Exception as e:
+        print(f"  Lever API error for {company}: {e}")
+        return []
+
+    jobs = []
+    for p in data:
+        loc = (p.get("categories") or {}).get("location", "") or ""
+        all_locs = " ".join(p.get("additional", "") or "")
+        if not is_israel_location(loc) and not is_israel_location(all_locs):
+            continue
+        desc_parts = [p.get("descriptionPlain") or strip_html(p.get("description") or "")]
+        for lst in p.get("lists", []) or []:
+            desc_parts.append(strip_html(lst.get("content", "")))
+        desc = (" ".join(x for x in desc_parts if x))[:5000] or None
+        jobs.append({
+            "company": company,
+            "title": (p.get("text") or "").strip(),
+            "url": p.get("hostedUrl") or p.get("applyUrl") or "",
+            "location": loc,
+            "is_active": True,
+            "description": desc,
+        })
+    return jobs
+
+
+# ─── ATS: Workable ───────────────────────────────────────────────────────────
+
+def extract_workable_slug(url: str) -> str | None:
+    m = re.search(r"(?:apply\.workable\.com|jobs\.workable\.com)/([^/?#]+)", url)
+    return m.group(1) if m else None
+
+
+async def scrape_workable(http: httpx.AsyncClient, company: str, url: str,
+                          slug: str | None = None) -> list[dict]:
+    if slug is None:
+        slug = extract_workable_slug(url)
+    if not slug:
+        return []
+    api = f"https://apply.workable.com/api/v3/accounts/{slug}/jobs"
+    try:
+        resp = await http.post(api, json={"query": "", "location": {"countryCode": "IL"}})
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+    except Exception as e:
+        print(f"  Workable API error for {company}: {e}")
+        return []
+
+    jobs = []
+    for j in data.get("results", []):
+        loc = ", ".join(filter(None, [j.get("city"), j.get("country")]))
+        if not is_israel_location(loc):
+            continue
+        url_to = f"https://apply.workable.com/{slug}/j/{j['shortcode']}/"
+        jobs.append({
+            "company": company,
+            "title": (j.get("title") or "").strip(),
+            "url": url_to,
+            "location": loc,
+            "is_active": True,
+            "description": None,  # Workable description requires per-job fetch
+        })
+    return jobs
+
+
+# ─── ATS: SmartRecruiters ───────────────────────────────────────────────────
+
+def extract_smartrecruiters_slug(url: str) -> str | None:
+    m = re.search(r"smartrecruiters\.com/([^/?#]+)", url)
+    if m and m.group(1) not in ("api",):
+        return m.group(1)
+    return None
+
+
+async def scrape_smartrecruiters(http: httpx.AsyncClient, company: str, url: str,
+                                 slug: str | None = None) -> list[dict]:
+    if slug is None:
+        slug = extract_smartrecruiters_slug(url)
+    if not slug:
+        return []
+    api = f"https://api.smartrecruiters.com/v1/companies/{slug}/postings?country=il&limit=100"
+    try:
+        resp = await http.get(api)
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+    except Exception as e:
+        print(f"  SmartRecruiters API error for {company}: {e}")
+        return []
+
+    jobs = []
+    for p in data.get("content", []):
+        loc = (p.get("location") or {})
+        loc_str = ", ".join(filter(None, [loc.get("city"), loc.get("country")]))
+        if not is_israel_location(loc_str):
+            continue
+        jobs.append({
+            "company": company,
+            "title": (p.get("name") or "").strip(),
+            "url": p.get("ref") or p.get("applyUrl") or "",
+            "location": loc_str,
+            "is_active": True,
+            "description": None,
+        })
+    return jobs
+
+
+# ─── ATS detection in URL ────────────────────────────────────────────────────
+
+def detect_ats_from_url(url: str) -> tuple[str | None, str | None]:
+    """Returns (ats_name, slug) if URL matches a known ATS pattern."""
+    if "greenhouse.io" in url or "gh_office=" in url:
+        slug, _ = extract_greenhouse_slug(url)
+        return ("greenhouse", slug) if slug else (None, None)
+    if "comeet.com" in url:
+        return ("comeet", None)
+    if "ashbyhq.com" in url:
+        slug = extract_ashby_slug(url)
+        return ("ashby", slug) if slug else (None, None)
+    if "lever.co" in url:
+        slug = extract_lever_slug(url)
+        return ("lever", slug) if slug else (None, None)
+    if "workable.com" in url:
+        slug = extract_workable_slug(url)
+        return ("workable", slug) if slug else (None, None)
+    if "smartrecruiters.com" in url:
+        slug = extract_smartrecruiters_slug(url)
+        return ("smartrecruiters", slug) if slug else (None, None)
+    return (None, None)
+
+
+# ─── Detect ATS by inspecting careers page ──────────────────────────────────
+
+async def detect_ats_from_page(page: Page) -> tuple[str | None, str | None]:
+    """Look for ATS iframes / API calls in the page."""
+    try:
+        # Check all iframes for known ATS
+        iframes = await page.query_selector_all("iframe[src]")
+        for iframe in iframes:
+            src = await iframe.get_attribute("src") or ""
+            ats, slug = detect_ats_from_url(src)
+            if ats:
+                return ats, slug
+
+        # Check page HTML for embed URLs
+        html = await page.content()
+        for ats_check in [
+            (r"(?:greenhouse\.io/embed/job_board\?for=|boards\.greenhouse\.io/|job-boards\.greenhouse\.io/)([\w\-]+)", "greenhouse"),
+            (r"jobs\.ashbyhq\.com/([\w\-]+)", "ashby"),
+            (r"jobs\.lever\.co/([\w\-]+)", "lever"),
+            (r"apply\.workable\.com/([\w\-]+)", "workable"),
+            (r"smartrecruiters\.com/([\w\-]+)", "smartrecruiters"),
+            (r"comeet\.com/jobs/([\w\-]+)", "comeet"),
+        ]:
+            pat, name = ats_check
+            m = re.search(pat, html)
+            if m:
+                return name, m.group(1)
+    except Exception:
+        pass
+    return None, None
+
+
+# ─── Generic browser scraper ─────────────────────────────────────────────────
 
 def is_likely_job_link(href: str, text: str, base_domain: str) -> bool:
     if not href or not text:
@@ -208,7 +529,10 @@ def is_likely_job_link(href: str, text: str, base_domain: str) -> bool:
     text = text.strip()
     if len(text) < 4 or len(text) > 150:
         return False
-    if any(w in text.lower() for w in SKIP_LINK_WORDS):
+    low = text.lower()
+    if any(low == w or low.startswith(w + " ") or low.endswith(" " + w) for w in SKIP_LINK_WORDS):
+        return False
+    if url_looks_like_apply_form(href):
         return False
     try:
         parsed = urlparse(href)
@@ -216,9 +540,11 @@ def is_likely_job_link(href: str, text: str, base_domain: str) -> bool:
             return False
         link_domain = parsed.netloc
         if base_domain not in link_domain and link_domain not in base_domain:
-            allowed_boards = {"greenhouse.io", "lever.co", "ashbyhq.com", "workday.com",
-                              "taleo.net", "zohorecruit.com", "hibob.com", "comeet.com"}
-            if not any(board in link_domain for board in allowed_boards):
+            allowed = {"greenhouse.io", "lever.co", "ashbyhq.com", "workday.com",
+                       "taleo.net", "zohorecruit.com", "hibob.com", "comeet.com",
+                       "workable.com", "smartrecruiters.com", "eightfold.ai",
+                       "myworkdayjobs.com", "icims.com"}
+            if not any(b in link_domain for b in allowed):
                 return False
     except Exception:
         return False
@@ -226,18 +552,16 @@ def is_likely_job_link(href: str, text: str, base_domain: str) -> bool:
 
 
 def find_job_links_by_pattern(all_links: list[tuple[str, str]], base_domain: str) -> list[tuple[str, str]]:
-    """Detect job listings by finding the most repeated URL pattern."""
     pattern_groups: dict[str, list[tuple[str, str]]] = defaultdict(list)
-
     for href, text in all_links:
         if not href:
             continue
         try:
             parsed = urlparse(href)
-            path_parts = [p for p in parsed.path.split("/") if p]
-            if len(path_parts) < 2:
+            parts = [p for p in parsed.path.split("/") if p]
+            if len(parts) < 2:
                 continue
-            pattern = parsed.netloc + "/" + "/".join(path_parts[:-1])
+            pattern = parsed.netloc + "/" + "/".join(parts[:-1])
             pattern_groups[pattern].append((href, text))
         except Exception:
             continue
@@ -245,22 +569,27 @@ def find_job_links_by_pattern(all_links: list[tuple[str, str]], base_domain: str
     if not pattern_groups:
         return []
 
-    best_pattern = max(pattern_groups, key=lambda k: len(set(u for u, _ in pattern_groups[k])))
-    candidates = [(u, t) for u, t in pattern_groups[best_pattern] if is_likely_job_link(u, t, base_domain)]
+    # Score patterns: prefer ones with many distinct URLs AND varied titles
+    def score(items):
+        urls = {u for u, _ in items}
+        texts = {t for _, t in items if t}
+        return len(urls) * (1 + min(len(texts), 50) / 50.0)
 
+    best = max(pattern_groups, key=lambda k: score(pattern_groups[k]))
+    candidates = [(u, t) for u, t in pattern_groups[best] if is_likely_job_link(u, t, base_domain)]
     if len(candidates) < 2:
         return []
 
     seen = set()
-    result = []
+    out = []
     for href, text in candidates:
         if href not in seen:
             seen.add(href)
-            result.append((href, text))
-    return result
+            out.append((href, text))
+    return out
 
 
-async def extract_json_ld_jobs(page: Page, company_name: str) -> list[dict]:
+async def extract_json_ld_jobs(page: Page, company: str) -> list[dict]:
     jobs = []
     try:
         scripts = await page.query_selector_all('script[type="application/ld+json"]')
@@ -272,18 +601,34 @@ async def extract_json_ld_jobs(page: Page, company_name: str) -> list[dict]:
                 data = json.loads(content)
                 items = data if isinstance(data, list) else [data]
                 for item in items:
+                    # ItemList of JobPostings
+                    if item.get("@type") == "ItemList":
+                        for li in item.get("itemListElement", []) or []:
+                            it = li.get("item") if isinstance(li, dict) else None
+                            if isinstance(it, dict) and it.get("@type") == "JobPosting":
+                                items.append(it)
+                        continue
                     if item.get("@type") == "JobPosting":
                         loc_obj = item.get("jobLocation", {})
                         if isinstance(loc_obj, list):
                             loc_obj = loc_obj[0] if loc_obj else {}
-                        addr = loc_obj.get("address", {})
-                        location = addr.get("addressLocality", "") or addr.get("addressRegion", "") or ""
+                        addr = (loc_obj or {}).get("address", {}) or {}
+                        location = (
+                            addr.get("addressLocality") or addr.get("addressRegion")
+                            or addr.get("addressCountry") or ""
+                        )
+                        if isinstance(location, dict):
+                            location = location.get("name", "")
+                        if not is_israel_location(str(location)):
+                            continue
+                        desc = strip_html(item.get("description", ""))[:5000]
                         jobs.append({
-                            "company": company_name,
-                            "title": item.get("title", "").strip(),
-                            "url": item.get("url", page.url),
-                            "location": location,
+                            "company": company,
+                            "title": (item.get("title") or "").strip(),
+                            "url": item.get("url") or page.url,
+                            "location": str(location),
                             "is_active": True,
+                            "description": desc or None,
                         })
             except (json.JSONDecodeError, AttributeError):
                 continue
@@ -292,23 +637,76 @@ async def extract_json_ld_jobs(page: Page, company_name: str) -> list[dict]:
     return jobs
 
 
-async def scrape_with_browser(context: BrowserContext, company_name: str, career_url: str) -> list[dict]:
+async def scroll_and_load_more(page: Page, max_iterations: int = 6):
+    """Scroll to bottom + try clicking 'Load more' buttons."""
+    last_count = -1
+    for _ in range(max_iterations):
+        try:
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(1200)
+            # Try common "Load more" buttons
+            for sel in [
+                'button:has-text("Load more")', 'button:has-text("Show more")',
+                'button:has-text("View more")', 'button:has-text("המשך")',
+                'a:has-text("Load more")', 'a:has-text("Show more")',
+            ]:
+                try:
+                    btn = await page.query_selector(sel)
+                    if btn:
+                        await btn.click(timeout=2000)
+                        await page.wait_for_timeout(1200)
+                except Exception:
+                    pass
+            count = await page.evaluate("document.querySelectorAll('a').length")
+            if count == last_count:
+                break
+            last_count = count
+        except Exception:
+            break
+
+
+async def scrape_with_browser(context: BrowserContext, company: str, career_url: str,
+                              http: httpx.AsyncClient) -> list[dict]:
     page = await context.new_page()
-    jobs = []
-
+    jobs: list[dict] = []
     try:
-        await page.goto(career_url, wait_until="domcontentloaded", timeout=45000)
-        await page.wait_for_timeout(3000)
+        try:
+            await page.goto(career_url, wait_until="domcontentloaded", timeout=45000)
+        except Exception as e:
+            print(f"  ✗ Could not load {career_url}: {e}")
+            return []
+        await page.wait_for_timeout(2500)
 
-        jobs = await extract_json_ld_jobs(page, company_name)
+        # 1) Detect embedded ATS (iframe / inline script) → route to dedicated API
+        ats, slug = await detect_ats_from_page(page)
+        if ats:
+            print(f"  → detected embedded {ats} ({slug})")
+            if ats == "greenhouse":
+                return await scrape_greenhouse(http, company, career_url, slug=slug)
+            if ats == "ashby":
+                return await scrape_ashby(http, company, career_url, slug=slug)
+            if ats == "lever":
+                return await scrape_lever(http, company, career_url, slug=slug)
+            if ats == "workable":
+                return await scrape_workable(http, company, career_url, slug=slug)
+            if ats == "smartrecruiters":
+                return await scrape_smartrecruiters(http, company, career_url, slug=slug)
+            if ats == "comeet":
+                # Slug-only detection isn't enough for comeet (needs code)
+                pass
+
+        # 2) JSON-LD structured data
+        jobs = await extract_json_ld_jobs(page, company)
         if jobs:
             print(f"  → {len(jobs)} jobs via JSON-LD")
             return jobs
 
-        base_domain = urlparse(career_url).netloc
-        link_elements = await page.query_selector_all("a[href]")
+        # 3) Generic HTML scraping
+        await scroll_and_load_more(page)
+        base_domain = urlparse(career_url).netloc.replace("www.", "")
+        link_els = await page.query_selector_all("a[href]")
         all_links = []
-        for el in link_elements:
+        for el in link_els:
             try:
                 href = await el.get_attribute("href")
                 text = (await el.text_content() or "").strip()
@@ -320,60 +718,74 @@ async def scrape_with_browser(context: BrowserContext, company_name: str, career
                 continue
 
         job_links = find_job_links_by_pattern(all_links, base_domain)
-
         if not job_links:
             print(f"  → 0 jobs found")
             return []
 
         print(f"  → {len(job_links)} jobs via link pattern")
 
-        for href, title in job_links[:100]:
+        for href, title in job_links[:150]:
             jobs.append({
-                "company": company_name,
-                "title": title,
+                "company": company,
+                "title": clean_title(title),
                 "url": href,
                 "location": "Israel",
                 "is_active": True,
+                "description": None,
             })
-
     except Exception as e:
-        print(f"  ✗ Browser error for {company_name}: {e}")
+        print(f"  ✗ Browser error for {company}: {e}")
     finally:
         await page.close()
-
     return jobs
 
 
-# ─── Phase 2: Job detail extraction ──────────────────────────────────────────
+# ─── Phase 2: detail extraction for jobs missing description ────────────────
 
 async def fetch_job_description(context: BrowserContext, url: str) -> str:
-    """Visit a single job page and return the main text content."""
     page = await context.new_page()
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(2000)
-
-        # Try to get the main content area
-        for selector in ["main", "article", '[class*="job-description"]',
-                          '[class*="description"]', '[id*="description"]', "body"]:
-            el = await page.query_selector(selector)
-            if el:
-                text = await el.inner_text()
-                if text and len(text) > 100:
-                    return text[:5000]  # Cap at 5000 chars for Claude
-    except Exception as e:
-        print(f"    ✗ Could not fetch {url}: {e}")
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        except Exception:
+            return ""
+        await page.wait_for_timeout(1500)
+        # First try JSON-LD on the job page itself
+        try:
+            scripts = await page.query_selector_all('script[type="application/ld+json"]')
+            for s in scripts:
+                content = await s.text_content() or ""
+                try:
+                    data = json.loads(content)
+                    items = data if isinstance(data, list) else [data]
+                    for it in items:
+                        if it.get("@type") == "JobPosting" and it.get("description"):
+                            return strip_html(it["description"])[:5000]
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        # Then try main-content selectors
+        for sel in ["main", "article", '[class*="job-description"]',
+                    '[class*="description"]', '[id*="description"]',
+                    '[class*="posting"]', "body"]:
+            try:
+                el = await page.query_selector(sel)
+                if el:
+                    text = await el.inner_text()
+                    if text and len(text) > 100:
+                        return text[:5000]
+            except Exception:
+                continue
     finally:
         await page.close()
     return ""
 
 
 def extract_details_with_claude(description: str, title: str) -> dict:
-    """Use Claude Haiku to extract structured data from job description."""
-    if not description.strip():
+    if not description or not description.strip():
         return {}
     if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("    ⚠ ANTHROPIC_API_KEY not set — skipping detail extraction")
         return {"description": description[:300]}
 
     ai = anthropic.Anthropic()
@@ -392,81 +804,88 @@ Return this exact JSON structure:
   "hard_skills": ["array", "of", "technical", "tools", "languages", "frameworks"],
   "soft_skills": ["array", "of", "interpersonal", "soft", "skills"]
 }}"""
-
     try:
         response = ai.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=600,
-            messages=[{"role": "user", "content": prompt}]
+            messages=[{"role": "user", "content": prompt}],
         )
         text = response.content[0].text.strip()
-        # Handle possible markdown code block wrapping
         text = re.sub(r"^```json\s*|\s*```$", "", text, flags=re.MULTILINE).strip()
         return json.loads(text)
     except Exception as e:
-        print(f"    ✗ Claude extraction error: {e}")
+        print(f"    ✗ Claude error: {e}")
         return {}
 
 
-async def enrich_jobs_with_details(supabase: Client, context: BrowserContext):
-    """Phase 2: Fetch description + extract details for new jobs."""
+async def enrich_jobs(supabase: Client, context: BrowserContext):
     jobs = get_jobs_needing_details(supabase)
     if not jobs:
-        print("\nNo new jobs need detail extraction.")
+        print("\nNo jobs need detail extraction.")
         return
+    print(f"\n── Phase 2: Enriching {len(jobs)} jobs ──")
 
-    print(f"\n── Phase 2: Enriching {len(jobs)} new jobs with details ──")
+    sem = asyncio.Semaphore(4)  # parallel fetches
 
-    for i, job in enumerate(jobs, 1):
-        print(f"  [{i}/{len(jobs)}] {job['company']} — {job['title'][:50]}")
+    async def process(i: int, job: dict):
+        async with sem:
+            print(f"  [{i}/{len(jobs)}] {job['company']} — {job['title'][:50]}")
+            desc = await fetch_job_description(context, job["url"])
+            if not desc:
+                save_job_details(supabase, job["id"], {"description": None})
+                return
+            details = extract_details_with_claude(desc, job["title"])
+            save_job_details(supabase, job["id"], details)
 
-        description_text = await fetch_job_description(context, job["url"])
-        if not description_text:
-            # Mark as fetched even if empty, so we don't retry forever
-            save_job_details(supabase, job["id"], {"description": None})
-            continue
-
-        details = extract_details_with_claude(description_text, job["title"])
-        save_job_details(supabase, job["id"], details)
-
-        # Small delay to respect rate limits
-        await asyncio.sleep(0.5)
-
+    await asyncio.gather(*(process(i, j) for i, j in enumerate(jobs, 1)))
     print(f"  ✓ Enrichment complete")
 
 
-# ─── Main orchestrator ────────────────────────────────────────────────────────
+# ─── Per-company dispatch ────────────────────────────────────────────────────
 
-def detect_ats(url: str) -> str:
-    if "greenhouse.io" in url or "gh_office=" in url:
-        return "greenhouse"
-    if "comeet.com" in url:
-        return "comeet"
-    return "browser"
-
-
-async def scrape_company(context: BrowserContext, company: dict) -> list[dict]:
+async def scrape_company(context: BrowserContext, http: httpx.AsyncClient, company: dict) -> list[dict]:
     name = company["name"]
     url = company["url"]
-    ats = detect_ats(url)
 
-    print(f"\n[{name}] ({ats})")
+    ats, slug = detect_ats_from_url(url)
+    print(f"\n[{name}] ({ats or 'browser'})")
 
     try:
         if ats == "greenhouse":
-            jobs = await scrape_greenhouse(name, url)
+            jobs = await scrape_greenhouse(http, name, url, slug=slug,
+                                            office_id=extract_greenhouse_slug(url)[1])
         elif ats == "comeet":
-            jobs = await scrape_comeet(name, url)
+            jobs = await scrape_comeet(http, name, url)
+        elif ats == "ashby":
+            jobs = await scrape_ashby(http, name, url, slug=slug)
+        elif ats == "lever":
+            jobs = await scrape_lever(http, name, url, slug=slug)
+        elif ats == "workable":
+            jobs = await scrape_workable(http, name, url, slug=slug)
+        elif ats == "smartrecruiters":
+            jobs = await scrape_smartrecruiters(http, name, url, slug=slug)
         else:
-            jobs = await scrape_with_browser(context, name, url)
+            jobs = await scrape_with_browser(context, name, url, http)
 
-        jobs = [j for j in jobs if j.get("title") and j.get("url")]
-        print(f"  Total: {len(jobs)} jobs")
-        return jobs
+        # Filter + clean
+        cleaned = []
+        for j in jobs:
+            if not j.get("title") or not j.get("url"):
+                continue
+            j["title"] = clean_title(j["title"], j.get("location", ""))
+            if not j["title"]:
+                continue
+            if url_looks_like_apply_form(j["url"]):
+                continue
+            cleaned.append(j)
+        print(f"  Total: {len(cleaned)} jobs")
+        return cleaned
     except Exception as e:
         print(f"  ✗ Unexpected error: {e}")
         return []
 
+
+# ─── Concurrency-controlled main ─────────────────────────────────────────────
 
 async def main():
     with open(COMPANIES_FILE) as f:
@@ -477,29 +896,39 @@ async def main():
 
     print(f"── Phase 1: Scraping {len(companies)} companies ──\n")
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            locale="he-IL",
-            viewport={"width": 1280, "height": 800},
-        )
+    async with httpx.AsyncClient(
+        follow_redirects=True, timeout=20,
+        headers={"User-Agent": UA, "Accept": "application/json,text/html,*/*"},
+    ) as http:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context(
+                user_agent=UA, locale="en-US",
+                viewport={"width": 1280, "height": 800},
+            )
 
-        # Phase 1: Collect job listings
-        for company in companies:
-            jobs = await scrape_company(context, company)
-            if jobs:
-                upsert_jobs(supabase, jobs)
-                mark_inactive_jobs(supabase, company["name"], {j["url"] for j in jobs})
-                total_jobs += len(jobs)
+            # Process companies with bounded concurrency
+            sem = asyncio.Semaphore(3)
 
-        print(f"\n✅ Phase 1 done. Total jobs: {total_jobs}")
+            async def handle(c):
+                async with sem:
+                    return c, await scrape_company(context, http, c)
 
-        # Phase 2: Enrich new jobs with descriptions + skills
-        await enrich_jobs_with_details(supabase, context)
+            results = await asyncio.gather(*(handle(c) for c in companies))
 
-        await context.close()
-        await browser.close()
+            for company, jobs in results:
+                if jobs:
+                    upsert_jobs(supabase, jobs)
+                    mark_inactive_jobs(supabase, company["name"], {j["url"] for j in jobs})
+                    total_jobs += len(jobs)
+
+            print(f"\n✅ Phase 1 done. Total jobs: {total_jobs}")
+
+            # Phase 2: enrich any jobs still missing description
+            await enrich_jobs(supabase, context)
+
+            await context.close()
+            await browser.close()
 
     print("\n✅ All done.")
 
