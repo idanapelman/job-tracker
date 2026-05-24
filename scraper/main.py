@@ -1006,20 +1006,34 @@ async def main():
                 viewport={"width": 1280, "height": 800},
             )
 
-            # Process companies with bounded concurrency
+            # Process companies with bounded concurrency, write INCREMENTALLY
             sem = asyncio.Semaphore(3)
+            PER_COMPANY_TIMEOUT = 90  # seconds — kill anything stuck longer
 
             async def handle(c):
                 async with sem:
-                    return c, await scrape_company(context, http, c)
+                    try:
+                        jobs = await asyncio.wait_for(
+                            scrape_company(context, http, c),
+                            timeout=PER_COMPANY_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        print(f"  ⚠ {c['name']} timed out after {PER_COMPANY_TIMEOUT}s")
+                        jobs = []
+                    except Exception as e:
+                        print(f"  ✗ {c['name']} crashed: {e}")
+                        jobs = []
+                    # Write to DB immediately so progress is durable
+                    if jobs:
+                        upsert_jobs(supabase, jobs)
+                        mark_inactive_jobs(supabase, c["name"], {j["url"] for j in jobs})
+                    return c["name"], len(jobs)
 
-            results = await asyncio.gather(*(handle(c) for c in companies))
-
-            for company, jobs in results:
-                if jobs:
-                    upsert_jobs(supabase, jobs)
-                    mark_inactive_jobs(supabase, company["name"], {j["url"] for j in jobs})
-                    total_jobs += len(jobs)
+            results = await asyncio.gather(*(handle(c) for c in companies),
+                                           return_exceptions=True)
+            for r in results:
+                if isinstance(r, tuple):
+                    total_jobs += r[1]
 
             print(f"\n✅ Phase 1 done. Total jobs: {total_jobs}")
 
