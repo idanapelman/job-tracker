@@ -372,6 +372,9 @@ def extract_details_with_claude(description: str, title: str) -> dict:
     """Use Claude Haiku to extract structured data from job description."""
     if not description.strip():
         return {}
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        print("    ⚠ ANTHROPIC_API_KEY not set — skipping detail extraction")
+        return {"description": description[:300]}
 
     ai = anthropic.Anthropic()
     prompt = f"""Extract structured data from this job posting. Return ONLY valid JSON, no explanation.
