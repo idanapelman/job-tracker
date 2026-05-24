@@ -319,7 +319,9 @@ async def scrape_ashby(http: httpx.AsyncClient, company: str, url: str,
         loc = j.get("location", "") or ""
         if not is_israel_location(loc):
             # Check secondary locations
-            sec = " ".join(j.get("secondaryLocations", []) or [])
+            sec_list = j.get("secondaryLocations", []) or []
+            sec = " ".join(s if isinstance(s, str) else (s.get("location") or s.get("name") or "")
+                           for s in sec_list)
             if not is_israel_location(sec):
                 continue
         desc_html = j.get("descriptionHtml") or ""
@@ -365,7 +367,8 @@ async def scrape_lever(http: httpx.AsyncClient, company: str, url: str,
     jobs = []
     for p in data:
         loc = (p.get("categories") or {}).get("location", "") or ""
-        all_locs = " ".join(p.get("additional", "") or "")
+        add = p.get("additional", "") or ""
+        all_locs = add if isinstance(add, str) else " ".join(str(x) for x in add)
         if not is_israel_location(loc) and not is_israel_location(all_locs):
             continue
         desc_parts = [p.get("descriptionPlain") or strip_html(p.get("description") or "")]
@@ -519,6 +522,90 @@ async def detect_ats_from_page(page: Page) -> tuple[str | None, str | None]:
     except Exception:
         pass
     return None, None
+
+
+# ─── Claude-based HTML extractor (high accuracy fallback) ──────────────────
+
+def claude_extract_jobs_from_html(company: str, page_url: str, page_text: str) -> list[dict]:
+    """Send page text to Claude and ask it to extract real job postings."""
+    if not os.environ.get("ANTHROPIC_API_KEY") or not page_text.strip():
+        return []
+    ai = anthropic.Anthropic()
+    prompt = f"""You extract real job postings from a company careers page.
+Return ONLY a JSON array, no explanation.
+
+Company: {company}
+Page URL: {page_url}
+Page text (visible content):
+\"\"\"
+{page_text[:12000]}
+\"\"\"
+
+Rules:
+- Include ONLY real, individual job openings (e.g. "Senior Backend Engineer", "Product Manager - Growth")
+- EXCLUDE: navigation links, product names, department headers, blog posts, category filters,
+  "Apply", "Sign up", login buttons, "All jobs", company info, marketing copy
+- Include ONLY jobs based in ISRAEL (Tel Aviv, Herzliya, Jerusalem, Haifa, etc.). If location isn't shown but the page is clearly Israel-only, include them.
+- For URL: if a job has its own page URL, include it. If relative (starts with /), keep it relative.
+  If no individual URL exists, use the page URL.
+- If NO real Israel jobs visible, return []
+- Max 100 jobs
+
+Return JSON array of:
+{{"title": "exact job title", "url": "job URL (relative ok)", "location": "city or Israel"}}"""
+    try:
+        response = ai.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=4000,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = response.content[0].text.strip()
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.MULTILINE).strip()
+        m = re.search(r"\[[\s\S]*\]", text)
+        if not m:
+            return []
+        data = json.loads(m.group(0))
+        result = []
+        for j in data:
+            if not isinstance(j, dict):
+                continue
+            url = (j.get("url") or "").strip()
+            if url and not url.startswith("http"):
+                url = urljoin(page_url, url)
+            if not url:
+                url = page_url
+            if url_looks_like_apply_form(url):
+                continue
+            title = (j.get("title") or "").strip()
+            if not title or len(title) < 3:
+                continue
+            result.append({
+                "company": company,
+                "title": title,
+                "url": url,
+                "location": (j.get("location") or "Israel").strip(),
+                "is_active": True,
+                "description": None,
+            })
+        return result
+    except Exception as e:
+        print(f"  ✗ Claude extract error: {e}")
+        return []
+
+
+async def get_page_visible_text(page: Page) -> str:
+    try:
+        html = await page.content()
+        # Strip script/style tags entirely
+        clean = re.sub(r"<(script|style|noscript)[^>]*>.*?</\1>",
+                       " ", html, flags=re.DOTALL | re.I)
+        # Also keep some link info (href + text) by replacing <a> with text + url
+        clean = re.sub(r'<a[^>]+href="([^"]+)"[^>]*>([^<]{1,120})</a>',
+                       r" \2 [\1] ", clean, flags=re.I)
+        text = strip_html(clean)
+        return text
+    except Exception:
+        return ""
 
 
 # ─── Generic browser scraper ─────────────────────────────────────────────────
@@ -701,8 +788,20 @@ async def scrape_with_browser(context: BrowserContext, company: str, career_url:
             print(f"  → {len(jobs)} jobs via JSON-LD")
             return jobs
 
-        # 3) Generic HTML scraping
+        # 3) Try to expand the page (lazy loading)
         await scroll_and_load_more(page)
+
+        # 4) Claude extraction from visible page text (most accurate fallback)
+        page_text = await get_page_visible_text(page)
+        if page_text and len(page_text) > 300:
+            jobs = await asyncio.to_thread(
+                claude_extract_jobs_from_html, company, career_url, page_text
+            )
+            if jobs:
+                print(f"  → {len(jobs)} jobs via Claude HTML extraction")
+                return jobs
+
+        # 5) Last-resort: link pattern heuristic
         base_domain = urlparse(career_url).netloc.replace("www.", "")
         link_els = await page.query_selector_all("a[href]")
         all_links = []
@@ -722,7 +821,7 @@ async def scrape_with_browser(context: BrowserContext, company: str, career_url:
             print(f"  → 0 jobs found")
             return []
 
-        print(f"  → {len(job_links)} jobs via link pattern")
+        print(f"  → {len(job_links)} jobs via link pattern (fallback)")
 
         for href, title in job_links[:150]:
             jobs.append({
