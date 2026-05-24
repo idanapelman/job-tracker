@@ -22,10 +22,11 @@ jobs:
           cache: "pip"
           cache-dependency-path: scraper/requirements.txt
 
-      - name: Install dependencies
-        run: |
-          pip install -r scraper/requirements.txt
-          playwright install chromium --with-deps
+      - name: Install Python dependencies
+        run: pip install -r scraper/requirements.txt
+
+      - name: Install Playwright browser
+        run: python -m playwright install --with-deps chromium
 
       - name: Run scraper
         env:
