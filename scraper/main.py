@@ -468,6 +468,206 @@ async def scrape_smartrecruiters(http: httpx.AsyncClient, company: str, url: str
     return jobs
 
 
+# ─── ATS: Workday (CXS public API) ───────────────────────────────────────────
+
+def extract_workday_info(url: str) -> tuple[str, str, str] | None:
+    """Returns (tenant, wd_subdomain, site) or None."""
+    m = re.match(r"https?://([^.]+)\.(wd\d+)\.myworkdayjobs\.com/(?:[a-z]{2}-[A-Z]{2}/)?([^/?#]+)", url)
+    if not m:
+        return None
+    return (m.group(1), m.group(2), m.group(3))
+
+
+async def scrape_workday(http: httpx.AsyncClient, company: str, url: str) -> list[dict]:
+    info = extract_workday_info(url)
+    if not info:
+        return []
+    tenant, wd, site = info
+    api = f"https://{tenant}.{wd}.myworkdayjobs.com/wday/cxs/{tenant}/{site}/jobs"
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    jobs: list[dict] = []
+    seen: set[str] = set()
+    # Iterate by searchText=israel + paginate
+    for search_text in ["israel", "tel aviv", "herzliya", "jerusalem", "haifa", "petach"]:
+        offset = 0
+        while True:
+            try:
+                resp = await http.post(api, headers=headers,
+                                       json={"limit": 20, "offset": offset,
+                                             "searchText": search_text})
+                if resp.status_code != 200:
+                    break
+                data = resp.json()
+            except Exception as e:
+                print(f"  Workday error for {company}: {e}")
+                break
+            postings = data.get("jobPostings") or []
+            if not postings:
+                break
+            for p in postings:
+                loc = p.get("locationsText") or ""
+                path = p.get("externalPath") or ""
+                if not path:
+                    continue
+                # Israel filter: title/path/loc
+                blob = f"{path} {loc}".lower()
+                if not is_israel_location(blob):
+                    continue
+                job_url = f"https://{tenant}.{wd}.myworkdayjobs.com{path.replace('/job/', '/en-US/' + site + '/job/')}"
+                # Cleaner URL: use raw path
+                job_url = f"https://{tenant}.{wd}.myworkdayjobs.com/en-US/{site}{path}"
+                if job_url in seen:
+                    continue
+                seen.add(job_url)
+                jobs.append({
+                    "company": company,
+                    "title": (p.get("title") or "").strip(),
+                    "url": job_url,
+                    "location": loc or "Israel",
+                    "is_active": True,
+                    "description": None,
+                })
+            if len(postings) < 20:
+                break
+            offset += 20
+            if offset > 200:
+                break
+    return jobs
+
+
+# ─── ATS: Amazon Jobs ────────────────────────────────────────────────────────
+
+async def scrape_amazon(http: httpx.AsyncClient, company: str, url: str) -> list[dict]:
+    # Detect AWS-only vs all Amazon
+    biz_cat = None
+    if "amazon-web-services" in url:
+        biz_cat = "amazon-web-services"
+    jobs: list[dict] = []
+    offset = 0
+    while offset < 1000:
+        params = {
+            "normalized_country_code[]": "ISR",
+            "result_limit": 100,
+            "offset": offset,
+            "sort": "recent",
+        }
+        if biz_cat:
+            params["business_category[]"] = biz_cat
+        try:
+            resp = await http.get("https://www.amazon.jobs/en/search.json",
+                                  params=params, headers={"Accept": "application/json"})
+            if resp.status_code != 200:
+                break
+            data = resp.json()
+        except Exception as e:
+            print(f"  Amazon error for {company}: {e}")
+            break
+        results = data.get("jobs") or []
+        if not results:
+            break
+        for j in results:
+            jp = j.get("job_path") or ""
+            if not jp:
+                continue
+            job_url = f"https://www.amazon.jobs{jp}"
+            loc = j.get("location") or j.get("normalized_location") or "Israel"
+            jobs.append({
+                "company": company,
+                "title": (j.get("title") or "").strip(),
+                "url": job_url,
+                "location": loc,
+                "is_active": True,
+                "description": strip_html(j.get("description") or "")[:5000] or None,
+            })
+        if len(results) < 100:
+            break
+        offset += 100
+    return jobs
+
+
+# ─── ATS: Eightfold (browser-rendered) ───────────────────────────────────────
+
+EIGHTFOLD_PATTERNS = (
+    "eightfold.ai",
+    "apply.careers.microsoft.com",
+    "careers.appliedmaterials.com",
+    "jobs.amdocs.com",
+)
+
+
+def is_eightfold(url: str) -> bool:
+    return any(p in url for p in EIGHTFOLD_PATTERNS)
+
+
+async def scrape_eightfold(context: BrowserContext, company: str, url: str) -> list[dict]:
+    """Eightfold requires CSRF/session — we use Playwright and intercept API responses."""
+    page = await context.new_page()
+    captured: list[dict] = []
+
+    async def on_response(resp):
+        try:
+            if "/api/apply/v2/jobs" in resp.url and resp.status == 200:
+                try:
+                    data = await resp.json()
+                    if isinstance(data, dict) and "positions" in data:
+                        captured.extend(data.get("positions") or [])
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    page.on("response", on_response)
+    try:
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        except Exception as e:
+            print(f"  Eightfold load error {company}: {e}")
+            return []
+        # Wait for jobs to load
+        await page.wait_for_timeout(5000)
+        # Scroll to trigger more loads
+        for _ in range(8):
+            try:
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await page.wait_for_timeout(1500)
+            except Exception:
+                break
+    finally:
+        await page.close()
+
+    jobs: list[dict] = []
+    seen: set[str] = set()
+    base = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+    for p in captured:
+        loc = p.get("location") or ""
+        if not is_israel_location(loc):
+            # Check locations array
+            locs = p.get("locations") or []
+            loc_blob = " ".join(str(x) for x in locs) if isinstance(locs, list) else str(locs)
+            if not is_israel_location(loc_blob):
+                continue
+        pid = p.get("id") or p.get("position_id")
+        if not pid:
+            continue
+        job_url = f"{base}/careers?pid={pid}&domain={urlparse(url).netloc.split('.')[-2]}.com"
+        # Better: use ats_job_id link if present
+        if p.get("canonicalPositionUrl"):
+            job_url = p["canonicalPositionUrl"]
+        if job_url in seen:
+            continue
+        seen.add(job_url)
+        desc = strip_html(p.get("job_description") or p.get("description") or "")[:5000] or None
+        jobs.append({
+            "company": company,
+            "title": (p.get("name") or p.get("title") or "").strip(),
+            "url": job_url,
+            "location": loc or "Israel",
+            "is_active": True,
+            "description": desc,
+        })
+    return jobs
+
+
 # ─── ATS detection in URL ────────────────────────────────────────────────────
 
 def detect_ats_from_url(url: str) -> tuple[str | None, str | None]:
@@ -489,6 +689,12 @@ def detect_ats_from_url(url: str) -> tuple[str | None, str | None]:
     if "smartrecruiters.com" in url:
         slug = extract_smartrecruiters_slug(url)
         return ("smartrecruiters", slug) if slug else (None, None)
+    if "myworkdayjobs.com" in url:
+        return ("workday", None)
+    if "amazon.jobs" in url:
+        return ("amazon", None)
+    if is_eightfold(url):
+        return ("eightfold", None)
     return (None, None)
 
 
@@ -514,6 +720,8 @@ async def detect_ats_from_page(page: Page) -> tuple[str | None, str | None]:
             (r"apply\.workable\.com/([\w\-]+)", "workable"),
             (r"smartrecruiters\.com/([\w\-]+)", "smartrecruiters"),
             (r"comeet\.com/jobs/([\w\-]+)", "comeet"),
+            (r"([\w\-]+\.wd\d+\.myworkdayjobs\.com)", "workday"),
+            (r"([\w\-]+\.eightfold\.ai)", "eightfold"),
         ]:
             pat, name = ats_check
             m = re.search(pat, html)
@@ -545,8 +753,13 @@ Rules:
 - Include ONLY real, individual job openings (e.g. "Senior Backend Engineer", "Product Manager - Growth")
 - EXCLUDE: navigation links, product names, department headers, blog posts, category filters,
   "Apply", "Sign up", login buttons, "All jobs", company info, marketing copy
-- Include ONLY jobs based in ISRAEL (Tel Aviv, Herzliya, Jerusalem, Haifa, etc.). If location isn't shown but the page is clearly Israel-only, include them.
-- For URL: if a job has its own page URL, include it. If relative (starts with /), keep it relative.
+- STRICT ISRAEL FILTER: Each job MUST be located in Israel. Look for: Tel Aviv, Herzliya,
+  Jerusalem, Haifa, Petah Tikva, Ra'anana, Rishon, Netanya, Yokneam, Beer Sheva, Israel,
+  ישראל, תל אביב, etc. If a job lists a non-Israeli city (Berlin, London, NYC, Helsinki,
+  Stockholm, Bangalore, etc.) DO NOT include it, even if the page also has Israel jobs.
+- If location is missing AND the page URL contains a country code or city slug for Israel
+  (he/, /israel, /tel-aviv) you may include them. Otherwise default-exclude.
+- For URL: prefer the job's own URL. If relative (starts with /), keep it relative.
   If no individual URL exists, use the page URL.
 - If NO real Israel jobs visible, return []
 - Max 100 jobs
@@ -579,11 +792,26 @@ Return JSON array of:
             title = (j.get("title") or "").strip()
             if not title or len(title) < 3:
                 continue
+            loc = (j.get("location") or "").strip()
+            # Hard reject obvious non-Israel cities/countries
+            NON_IL = ("berlin", "london", "new york", "nyc", "san francisco",
+                      "helsinki", "stockholm", "bangalore", "munich", "paris",
+                      "amsterdam", "warsaw", "dublin", "singapore", "tokyo",
+                      "sydney", "barcelona", "madrid", "vienna", "prague",
+                      "boston", "austin", "seattle", "chicago", "remote - us",
+                      "remote - eu", "remote, us", "united states", "germany",
+                      "france", "spain", "uk", "united kingdom")
+            low_loc = loc.lower()
+            if any(c in low_loc for c in NON_IL):
+                continue
+            # If location given and doesn't look Israeli, reject unless empty
+            if loc and not is_israel_location(loc) and "israel" not in low_loc:
+                continue
             result.append({
                 "company": company,
                 "title": title,
                 "url": url,
-                "location": (j.get("location") or "Israel").strip(),
+                "location": loc or "Israel",
                 "is_active": True,
                 "description": None,
             })
@@ -778,6 +1006,12 @@ async def scrape_with_browser(context: BrowserContext, company: str, career_url:
                 return await scrape_workable(http, company, career_url, slug=slug)
             if ats == "smartrecruiters":
                 return await scrape_smartrecruiters(http, company, career_url, slug=slug)
+            if ats == "workday":
+                # slug here is the host
+                wd_url = f"https://{slug}/External" if slug and "myworkdayjobs.com" in slug else career_url
+                return await scrape_workday(http, company, wd_url)
+            if ats == "eightfold":
+                return await scrape_eightfold(context, company, career_url)
             if ats == "comeet":
                 # Slug-only detection isn't enough for comeet (needs code)
                 pass
@@ -963,6 +1197,12 @@ async def scrape_company(context: BrowserContext, http: httpx.AsyncClient, compa
             jobs = await scrape_workable(http, name, url, slug=slug)
         elif ats == "smartrecruiters":
             jobs = await scrape_smartrecruiters(http, name, url, slug=slug)
+        elif ats == "workday":
+            jobs = await scrape_workday(http, name, url)
+        elif ats == "amazon":
+            jobs = await scrape_amazon(http, name, url)
+        elif ats == "eightfold":
+            jobs = await scrape_eightfold(context, name, url)
         else:
             jobs = await scrape_with_browser(context, name, url, http)
 
@@ -1007,8 +1247,8 @@ async def main():
             )
 
             # Process companies with bounded concurrency, write INCREMENTALLY
-            sem = asyncio.Semaphore(3)
-            PER_COMPANY_TIMEOUT = 90  # seconds — kill anything stuck longer
+            sem = asyncio.Semaphore(5)
+            PER_COMPANY_TIMEOUT = 150  # seconds — kill anything stuck longer (Eightfold needs ~30s)
 
             async def handle(c):
                 async with sem:
